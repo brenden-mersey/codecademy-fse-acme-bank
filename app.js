@@ -3,24 +3,50 @@ const express = require("express");
 const session = require("express-session");
 const path = require("path");
 const fs = require("fs");
+const helmet = require("helmet");
+const validator = require("express-validator");
+const csurf = require("csurf");
+const cookieParser = require("cookie-parser");
 
 const db = new sqlite3.Database("./bank_sample.db");
 
 const app = express();
 const PORT = 3000;
+
 app.set("view engine", "ejs");
 app.use(express.static(path.join(__dirname, "public")));
+app.use(helmet());
 
 app.use(
   session({
     secret: "secret",
     resave: true,
     saveUninitialized: true,
+    cookie: {
+      sameSite: 'none',
+      secure: true
+    }
   })
 );
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+app.use(cookieParser());
+
+const csurfMiddleware = csurf({
+  cookie: {
+    sameSite: 'none'
+  }
+});
+
+app.use(( err, req, res, next ) => {
+  if ( "EBADCSRFTOKEN" === err.code ) {
+    res.status(403);
+    res.send("The token was invalid.");
+  } else {
+    next();
+  }
+});
 
 app.get("/", function (request, response) {
   response.sendFile(path.join(__dirname + "/html/login.html"));
@@ -32,7 +58,11 @@ app.post("/auth", function (request, response) {
   var password = request.body.password;
   if (username && password) {
     db.get(
-      `SELECT * FROM users WHERE username = '${request.body.username}' AND password = '${request.body.password}'`,
+      `SELECT * FROM users WHERE username = $username AND password = $password`,
+      {
+        $username: username,
+        $password: password
+      },
       function (error, results) {
         console.log(error);
         console.log(results);
@@ -68,17 +98,17 @@ app.get("/home", function (request, response) {
 });
 
 //CSRF CODE SECURED. SEE HEADERS SET ABOVE
-app.get("/transfer", function (request, response) {
+app.get("/transfer", csurfMiddleware, function (request, response) {
   if (request.session.loggedin) {
     var sent = "";
-    response.render("transfer", { sent });
+    response.render("transfer", { sent, csrfToken: request.csrfToken() });
   } else {
     response.redirect("/");
   }
 });
 
 //CSRF CODE
-app.post("/transfer", function (request, response) {
+app.post("/transfer", csurfMiddleware, function (request, response) {
   if (request.session.loggedin) {
     console.log("Transfer in progress");
     var balance = request.session.balance;
@@ -127,17 +157,24 @@ app.get("/download", function (request, response) {
 
 app.post("/download", function (request, response) {
   if (request.session.loggedin) {
-    var file_name = request.body.file;
+
+    let file_name = request.body.file;
+    const rootDirectory = "history_files\\";
+    const filePath = path.join( process.cwd() + "/history_files/" + file_name );
+    const filename = path.normalize(filePath);
 
     response.statusCode = 200;
     response.setHeader("Content-Type", "text/html");
 
-    // Change the filePath to current working directory using the "path" method
-    const filePath = "history_files/" + file_name;
     console.log(filePath);
+
     try {
-      content = fs.readFileSync(filePath, "utf8");
-      response.end(content);
+      if ( filename.indexOf(rootDirectory) < 0 ) {
+        response.end("File not found");
+      } else {
+        content = fs.readFileSync(filePath, "utf8");
+        response.end(content);
+      }
     } catch (err) {
       console.log(err);
       response.end("File not found");
@@ -164,22 +201,26 @@ app.get("/public_forum", function (request, response) {
 
 app.post("/public_forum", function (request, response) {
   if (request.session.loggedin) {
-    var comment = request.body.comment;
+    var comment = validator.escape(request.body.comment);
     var username = request.session.username;
     if (comment) {
       db.all(
-        `INSERT INTO public_forum (username,message) VALUES ('${username}','${comment}')`,
+        `INSERT INTO public_forum (username,message) VALUES ($username, $comment)`,
+        {
+          $username: username,
+          $comment: comment
+        },
         (err, rows) => {
           console.log(err);
         }
       );
-      db.all(`SELECT username,message FROM public_forum`, (err, rows) => {
+      db.all(`SELECT username, message FROM public_forum`, (err, rows) => {
         console.log(rows);
         console.log(err);
         response.render("forum", { rows });
       });
     } else {
-      db.all(`SELECT username,message FROM public_forum`, (err, rows) => {
+      db.all(`SELECT username, message FROM public_forum`, (err, rows) => {
         console.log(rows);
         console.log(err);
         response.render("forum", { rows });
@@ -196,10 +237,11 @@ app.post("/public_forum", function (request, response) {
 //SQL UNION INJECTION
 app.get("/public_ledger", function (request, response) {
   if (request.session.loggedin) {
-    var id = request.query.id;
-    if (id) {
+    var id = parseInt(request.query.id);
+    if ( validator.isInt(id, {min: 0}) ) {
       db.all(
-        `SELECT * FROM public_ledger WHERE from_account = '${id}'`,
+        `SELECT * FROM public_ledger WHERE from_account = $id`,
+        { $id: id  },
         (err, rows) => {
           console.log("PROCESSING INPU");
           console.log(err);
